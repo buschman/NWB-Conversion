@@ -39,7 +39,7 @@ def AddPlexonSpikeDataToNWB(plx_file_name, nwb_file_name='', nwb_file=None, elec
 
     # Check to see if an open NWB file was passed, if so use that
     nwb_io = None
-    if nwb_file == None:
+    if nwb_file is None:
         # Check to see if valid nwb_file_name is passed
         if not nwb_file_name:
             nwb_file_name = path.splitext(plx_file_name)[0] + '.nwb'
@@ -71,7 +71,9 @@ def AddPlexonSpikeDataToNWB(plx_file_name, nwb_file_name='', nwb_file=None, elec
         plx_file = neo.io.PlexonIO(plx_file_name)
     except:  # catch *all* exceptions
         e = sys.exc_info()[0]
-        raise FileNotFoundError("Couldn't open Plexon file. Error: %s" % e)
+        warnings.warn("Couldn't open Plexon file. Error: %s" % e, UserWarning)
+        return ""
+
 
     # Validate the elec_ids list
     if not elec_ids:
@@ -88,9 +90,12 @@ def AddPlexonSpikeDataToNWB(plx_file_name, nwb_file_name='', nwb_file=None, elec
         nwb_file.add_processing_module(ecephys_module)
 
     # Create data interface for the spike waveforms
-    cur_eventwaveform = EventWaveform(name="Spike waveforms from %s" % (path.split(plx_file_name)[1]))
-    if verbose:
-        print("Created EventWaveform data interface (%s)" % (cur_eventwaveform.name))
+    event_waveform_name = "Spike waveforms from %s" % (path.split(plx_file_name)[1])
+    if event_waveform_name not in nwb_file.processing['ecephys'].data_interfaces.keys():
+        cur_eventwaveform = EventWaveform(name="Spike waveforms from %s" % (path.split(plx_file_name)[1]))
+        if verbose: print("Created EventWaveform data interface (%s)" % (cur_eventwaveform.name))
+    else:
+        cur_eventwaveform = nwb_file.processing['ecephys'].data_interfaces[event_waveform_name]
 
     # Loop through and save spiking data for each electrode --  we are doing this separately for each electrode so that
     # we can save information about the threshold used for each channel in the description.
@@ -125,13 +130,34 @@ def AddPlexonSpikeDataToNWB(plx_file_name, nwb_file_name='', nwb_file=None, elec
         # Grab all of the waveforms
         wf = np.array(plx_file.get_spike_raw_waveforms(unit_index=unit_index_list[0]))
         ts = np.array(plx_file.get_spike_timestamps(unit_index=unit_index_list[0]))
+        # Check the length of these waveforms against what already exists
+        spk_wf_len = wf.shape[1]
         for i in np.arange(1, len(unit_index_list)):
-            wf = np.concatenate([wf, np.array(plx_file.get_spike_raw_waveforms(unit_index=unit_index_list[i]))], axis=0)
             ts = np.concatenate([ts, np.array(plx_file.get_spike_timestamps(unit_index=unit_index_list[i]))], axis=0)
+            cur_wf = np.array(plx_file.get_spike_raw_waveforms(unit_index=unit_index_list[i]))
+            # Check the length of the waveforms against the limit for this interface
+            if cur_wf.shape[1] > spk_wf_len:
+                # Clip outer edges of waveform
+                if verbose:
+                    warnings.warn("Unit index %d on electrode %d has too many waveform points (%d). Clipping to %d." % (
+                        i, cur_elec, wf.shape[1], spk_wf_len))
+                wf_clip = int(np.round((cur_wf.shape[1] - spk_wf_len) / 2) - 1)
+                cur_wf = cur_wf[:, wf_clip:(wf_clip + spk_wf_len)]
+            elif cur_wf.shape[1] < spk_wf_len:
+                # Pad with zeros to get to correct size
+                if verbose:
+                    warnings.warn("Unit index %d on electrode %d has too many waveform points (%d). Clipping to %d." % (
+                        i, cur_elec, wf.shape[1], spk_wf_len))
+                temp_wf = np.zeros((cur_wf.shape[0], spk_wf_len))
+                wf_pad = int(np.round((spk_wf_len - cur_wf.shape[1]) / 2) - 1)
+                temp_wf[:, wf_pad:(wf_pad + wf.shape[1])] = cur_wf
+                cur_wf = temp_wf
+            # Add current waveforms to overall matrix
+            wf = np.concatenate([wf, cur_wf], axis=0)
         wf = wf.squeeze()
 
         # Write raw data for the electrode
-        if verbose: print("\tAdding to NWB...", end='')
+        if verbose: print("\tAdding waveforms (%d by %d) to NWB..." % (wf.shape), end='')
         # Create spike event series
         spike_wf = SpikeEventSeries('Spike waveforms for Channel %s' % (cur_elec),
                                     wf,
@@ -148,6 +174,12 @@ def AddPlexonSpikeDataToNWB(plx_file_name, nwb_file_name='', nwb_file=None, elec
     nwb_file.processing['ecephys'].add(cur_eventwaveform)
 
     if add_units:
+        # Check to see if we have any units already
+        if (nwb_file.units is not None) and ('waveform_mean' in nwb_file.units.colnames):
+            unit_wf_len = nwb_file.units['waveform_mean'].data[0].shape[-1]
+        else:
+            unit_wf_len = np.NaN
+
         # Check to see if user rating column already exists
         if (not nwb_file.units) or ('UserRating' not in nwb_file.units.colnames):
             nwb_file.add_unit_column('UserRating', 'Quality of isolation, as rated by user.')
@@ -183,6 +215,27 @@ def AddPlexonSpikeDataToNWB(plx_file_name, nwb_file_name='', nwb_file=None, elec
                 wf = wf.squeeze()
                 ts = plx_file.get_spike_timestamps(unit_index=cur_unit_index)
 
+                # Check the length of the waveforms against the limit for the file
+                if np.isnan(unit_wf_len):
+                    # Units haven't been written yet, we get to define the length of waveforms
+                    unit_wf_len = wf.shape[1]
+                if wf.shape[1] > unit_wf_len:
+                    # Clip outer edges of waveform
+                    if verbose:
+                        warnings.warn("Unit %d on electrode %d has too many waveform points (%d). Clipping to %d." % (
+                            cur_unit, cur_elec, wf.shape[1], unit_wf_len))
+                    wf_clip = int(np.round((wf.shape[1] - unit_wf_len) / 2) - 1)
+                    wf = wf[:, wf_clip:(wf_clip + unit_wf_len)]
+                elif wf.shape[1] < unit_wf_len:
+                    # Pad with zeros to get to correct size
+                    if verbose:
+                        warnings.warn("Unit %d on electrode %d has too few waveform points (%d). Clipping to %d." % (
+                            cur_unit, cur_elec, wf.shape[1], unit_wf_len))
+                    temp_wf = np.zeros((wf.shape[0], unit_wf_len))
+                    wf_pad = int(np.round((unit_wf_len - wf.shape[1]) / 2) - 1)
+                    temp_wf[:, wf_pad:(wf_pad + wf.shape[1])] = wf
+                    wf = temp_wf
+
                 # Interval over which this unit was observed
                 obs_intervals = np.zeros((1,2))
                 obs_intervals[0,0] = np.min(ts)
@@ -200,6 +253,14 @@ def AddPlexonSpikeDataToNWB(plx_file_name, nwb_file_name='', nwb_file=None, elec
                         cur_unit_info = {'UserRating': -1, 'UserComment': ''}
                     else:
                         cur_unit_info = unit_info[i]
+                #Make sure UserComment is a string
+                if not isinstance(cur_unit_info['UserComment'], str):
+                    warnings.warn('UserComment for Unit %d on Electrode %d was not valid. Setting to empty.' % (cur_unit, cur_elec))
+                    cur_unit_info['UserComment'] = ''
+                # Make sure UserComment is a string
+                if not isinstance(cur_unit_info['UserRating'], int):
+                    warnings.warn('UserRating for Unit %d on Electrode %d was not valid. Setting to empty.' % (cur_unit, cur_elec))
+                    cur_unit_info['UserRating'] = -1
 
                 # Add to NWB file
                 nwb_file.add_unit(spike_times=ts,
