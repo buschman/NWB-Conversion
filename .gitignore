@@ -19,3 +19,5 @@ pynwb/
 scrap_code.py
 test.py
 /Gating/
+ExampleProcessingPipeline_Pavlos.py
+test.nwb

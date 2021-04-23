@@ -169,7 +169,7 @@ def NWBFilterLFP(nwb_file, signal_name=None, elec_ids=None, filter_info=None, do
 
 
 
-def NWBWaveletTransform(nwb_file, signal_name=None, freq=None, width=None, elec_ids=None, wavelet_type='morlet', downsample=None, copy_file=False, verbose=True):
+def NWBWaveletTransform(nwb_file, signal_name=None, freq=None, width=None, elec_ids=None, wavelet_type='morlet', filter_info=None, downsample=None, copy_file=False, verbose=True):
     """
     Does a wavelet transform on electrophysiology data from NWB file. Saves in a new processing module
     in the same NWB file.
@@ -180,6 +180,7 @@ def NWBWaveletTransform(nwb_file, signal_name=None, freq=None, width=None, elec_
     :param width: [optional] {list of floats} Width of the wavelet to be used (measured in # of cycles in time). Default is 2.5.
     :param elec_ids: [optional] {List of integers} List of electrodes to decompose. Default is all electrodes.
     :param wavelet_type: [optional] {str} Type of wavelet to use. Currently only 'morlet' is valid.
+    :param filter_info: [optional] {dict} Information about filter to apply to data. Should contain 'name' of filter (butter, cheby1, cheby2, ellip), 'filt_order' specifies the filter order, and 'freq_range' specifies the band-pass frequencies. Other filters need passband or stopband dBs specified
     :param downsample: [optional] {int} If specified, downsample signal by this ratio. Default is None (keep original)
     :param verbose: [optional] {bool} Whether to print updates of progress. Default is False.
     :return: {NWB file or str} Depending on type of nwb_file input passed, either returns an open NWB file handle or the string of the file name.
@@ -190,17 +191,28 @@ def NWBWaveletTransform(nwb_file, signal_name=None, freq=None, width=None, elec_
         raise ValueError("Must pass a NWB file.")
     if type(nwb_file) == file.NWBFile:
         if verbose: print("Using passed NWB file.")
+        if copy_file:
+            nwb_file = nwb_file.copy()
     elif type(nwb_file) == str:
         nwb_file_name = nwb_file
-        [nwb_file, nwb_io] = OpenNWBFile(nwb_file_name, verbose=verbose)
+        # Open file
+        # Check to see if we should do a copy of the file first
+        if copy_file:
+            if verbose: print("Opening NWB file for read-only and doing a shallow copy.", flush=True)
+            [nwb_file, nwb_io] = OpenNWBFile(nwb_file_name, verbose=verbose, mode='r')
+            nwb_file = nwb_file.copy()
+        else:
+            if verbose: print("Opening existing NWB file to append.", flush=True)
+            [nwb_file, nwb_io] = OpenNWBFile(nwb_file_name, verbose=verbose, mode='a')
     else:
         raise ValueError("NWB file was not valid.")
 
-    # Check to see if we should do a copy of the file first
-    if copy_file:
-        nwb_file = nwb_file.copy()
+    # If no signal is passed, just use the first acquisition series
+    if signal_name is None:
+        signal_name = list(nwb_file.acquisition.keys())[0]
 
     # Parse name of signal we want to transform, grab electrical series
+    if verbose: print("Applying wavelet to signal %s." % (signal_name), flush=True)
     if signal_name in nwb_file.acquisition.keys():
         # Then use raw data
         cur_es = nwb_file.acquisition[signal_name]
@@ -222,15 +234,43 @@ def NWBWaveletTransform(nwb_file, signal_name=None, freq=None, width=None, elec_
                 cur_es_data = np.concatenate((cur_es_data, cur_es[cur_key].data), axis=1)
                 es_elec_ids = np.concatenate((es_elec_ids, cur_es[cur_key].electrodes.table[:,0]))
 
+    # Parse filter type
+    if filter_info is None:
+        sos = None
+    elif filter_info['name'].lower() == 'butter':
+        filt_str = "Butterworth: Order %d, %2.1f to %2.1f Hz" % (
+        filter_info['filt_order'], filter_info['freq_range'][0], filter_info['freq_range'][1])
+        sos = signal.butter(filter_info['filt_order'], np.array(filter_info['freq_range']) / cur_es_rate,
+                            btype='bandpass', output='sos')
+    elif filter_info['name'].lower() == 'cheby1':
+        filt_str = "Chebyshov Type-I Filter: Order %d, Bandpass Ripple %3.2f dB, %2.1f to %2.1f Hz" % \
+                   (filter_info['filt_order'], filter_info['ripple_dB'], filter_info['freq_range'][0],
+                    filter_info['freq_range'][1])
+        sos = signal.cheby1(filter_info['filt_order'], filter_info['ripple_dB'], np.array([0.5, 120]) / cur_es_rate,
+                            btype='bandpass', output='sos')
+    elif filter_info['name'].lower() == 'cheby2':
+        filt_str = "Chebyshov Type-II Filter: Order %d, Bandpass Ripple %3.2f dB, %2.1f to %2.1f Hz" % \
+                   (filter_info['filt_order'], filter_info['ripple_dB'], filter_info['freq_range'][0],
+                    filter_info['freq_range'][1])
+        sos = signal.cheby2(filter_info['filt_order'], filter_info['ripple_dB'], np.array([0.5, 120]) / cur_es_rate,
+                            btype='bandpass', output='sos')
+    elif filter_info['name'].lower() == 'ellip':
+        filt_str = "Elliptic Filter: Order %d, Bandpass Ripple %3.2f dB, Stopband %3.2f dB, %2.1f to %2.1f Hz" % \
+                   (filter_info['filt_order'], filter_info['ripple_dB'], filter_info['stop_dB'],
+                    filter_info['freq_range'][0], filter_info['freq_range'][1])
+        sos = signal.ellip(filter_info['filt_order'], filter_info['ripple_dB'], filter_info['stop_dB'],
+                           np.array([0.5, 120]) / cur_es_rate, btype='bandpass', output='sos')
+    if (sos is not None) and verbose: print("Created filter: %s..." % (filt_str), flush=True)
+
     # Parse wavelet type
-    if not wavelet_type:
+    if wavelet_type is None:
         wavelet_type = 'morlet'
     wavelet_type = wavelet_type.lower()
 
     # Parse inputs on wavelets
-    if not freq:
+    if freq is None:
         freq = np.arange(1, 101, 1)
-    if not width:
+    if width is None:
         width = 6
 
     # Convert width (# of cycles) to standard deviation
@@ -273,24 +313,33 @@ def NWBWaveletTransform(nwb_file, signal_name=None, freq=None, width=None, elec_
         if downsample > 1:
             num_samples = int(round(cur_es_data.shape[0]/downsample))
             cur_rate = cur_rate/downsample
+    if verbose: print("Intializing the CWT array (size [%d, %d, %d])" % (num_samples, len(elec_ids), len(freq)), flush=True)
     cwt_data = np.NaN * np.ones((num_samples, len(elec_ids), len(freq)), dtype=np.complex128)
 
     # Apply wavelets to each electrode in turn
-    if verbose: print("Wavelet transforming signal (wavelet=%s):" % (wavelet_type))
+    if verbose: print("Wavelet transforming signal (wavelet=%s). There are a total of %d electrodes:" % (wavelet_type, len(elec_ids)))
     for cur_elec in elec_ids:
         cur_sig_ind = np.where(es_elec_ids==cur_elec)[0][0]
-        if verbose: print("\tTransforming signal from electrode %d (signal %d)..." % (cur_elec, cur_sig_ind), end='')
+        if verbose: print("\tTransforming signal from electrode %d (signal %d)..." % (cur_elec, cur_sig_ind), end='', flush=True)
+
+        # If filter is specified, apply it to signal
+        if sos is not None:
+            temp_es_data = signal.sosfiltfilt(sos, cur_es_data[:, cur_sig_ind], axis=0)
+        else:
+            temp_es_data = cur_es_data[:, cur_sig_ind]
+
         # Apply wavelet to ephys signal
         if wavelet_type == 'morlet':
-            cur_cwt = signal.cwt(cur_es_data[:, cur_sig_ind], signal.morlet2, wavelet_widths, w=width)
+            cur_cwt = signal.cwt(temp_es_data, signal.morlet2, wavelet_widths, w=width)
         else:
             raise ValueError("Requested wavelet type is not valid.")
-        # Downsample to new frequency
+
+        # Downsample to new rate
         if (downsample > 1):
-            cur_cwt = cur_cwt[:,0::downsample]
+            cur_cwt = cur_cwt[:, 0::downsample]
         # Add to overall data
         cwt_data[:, cur_sig_ind, :] = cur_cwt.transpose()
-        if verbose: print("done.")
+        if verbose: print("done.", flush=True)
 
     # Create spectral decomposition data interface
     cwt_decomp = DecompositionSeries('CWT of %s' % (signal_name),
@@ -300,7 +349,7 @@ def NWBWaveletTransform(nwb_file, signal_name=None, freq=None, width=None, elec_
                                                  (wavelet_type, width, signal_name, elec_ids),
                                      unit='Arbitrary (complex)',
                                      source_timeseries=cur_es,
-                                     starting_time=cur_es.starting_time,
+                                     starting_time=cur_es_starting_time,
                                      rate=cur_rate,
                                      comments='This is the complex transform. Further analysis needed for getting magnitude of phase')
     for cur_f in freq:
